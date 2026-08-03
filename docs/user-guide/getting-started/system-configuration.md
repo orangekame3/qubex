@@ -146,6 +146,55 @@ specify both. A mux entry inherits omitted voltage-control values from
 not listed raises an error instead of guessing a channel, so a voltage can
 never reach an unintended output.
 
+To control a Qblox SPI Rack through a server process that owns its USB
+connection, use the `qblox_server` driver. Qubex connects to that server as a
+TCP client. Because a single process keeps ownership of the serial device,
+this is the recommended configuration when multiple systems use the same
+instrument.
+
+```yaml
+dc_voltage_controllers:
+  jpa_bias:
+    driver: qblox_server
+
+    connection:
+      host: "<qblox-backend-host>"
+      port: <qblox-backend-port>
+      timeout_s: 1200
+      channels:
+        1: "<backend-device-name-1>"
+        2: "<backend-device-name-2>"
+
+    voltage_control:
+      defaults:
+        ramp:
+          rate_v_per_s: 0.1
+          step_interval_s: 0.1
+        shutdown:
+          voltage_v: 0.0
+        readback:
+          tolerance_v: 0.001
+          max_attempts: 3
+
+      muxes:
+        6:
+          channel: 1
+```
+
+The channel values in `connection.channels` are the device identifiers managed
+by the server. Qubex delegates each complete ramp to the server-side sweep
+command so another client cannot interleave setpoints within that ramp. The
+server processes a sweep synchronously, so operations on other channels may
+wait until it finishes. Do not expose an unauthenticated socket outside a
+trusted network.
+
+The D5a module has no physical per-channel output switch, and the standard
+bipolar span is limited to -4 V through 4 V. With this driver, shutdown means
+ramping to `shutdown.voltage_v`; it does not electrically disconnect the
+output, and direct `turn_on()` and `turn_off()` calls are unsupported. The
+reported voltage is the module's stored output setting, not an independent
+voltage measurement.
+
 `ramp.rate_v_per_s` is the voltage change per second and
 `ramp.step_interval_s` is the interval between setpoints. Their product is the
 maximum voltage change per step. On context exit, Qubex ramps to
