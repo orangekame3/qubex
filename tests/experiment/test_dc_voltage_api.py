@@ -1,0 +1,383 @@
+"""Tests for Experiment DC voltage helpers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+import pytest
+
+from qubex.experiment.experiment_context import ExperimentContext
+from qubex.external_devices import DCVoltageProfile
+
+
+@dataclass(frozen=True)
+class _Mux:
+    index: int
+    label: str
+
+
+class _ControlParams:
+    def get_dc_voltage(self, mux: int) -> float:
+        return {6: 0.76, 7: 0.42}[mux]
+
+
+class _ExperimentSystem:
+    control_params = _ControlParams()
+
+    def __init__(self) -> None:
+        self.muxes = {
+            "MUX06": _Mux(index=6, label="MUX06"),
+            "MUX07": _Mux(index=7, label="MUX07"),
+        }
+
+    def get_mux(self, mux: int | str) -> _Mux:
+        if isinstance(mux, int):
+            return {item.index: item for item in self.muxes.values()}[mux]
+        return self.muxes[mux]
+
+
+class _DCVoltageController:
+    def __init__(self) -> None:
+        self.voltages: dict[int, float] = {}
+        self.output_states: dict[int, bool] = {}
+        self.calls: list[tuple[object, ...]] = []
+        self.fail_set_voltage = False
+
+    def on(self, *, channel: int) -> None:
+        self.calls.append(("on", channel))
+        self.output_states[channel] = True
+
+    def off(self, *, channel: int) -> None:
+        self.calls.append(("off", channel))
+        self.output_states[channel] = False
+
+    def set_voltage(self, *, channel: int, voltage: float) -> None:
+        if self.fail_set_voltage:
+            raise RuntimeError("restore failed")
+        self.calls.append(("set_voltage", channel, voltage))
+        self.voltages[channel] = voltage
+
+    def get_voltage(self, *, channel: int) -> float:
+        self.calls.append(("get_voltage", channel))
+        return self.voltages.get(channel, 0.0)
+
+    def is_output_on(self, *, channel: int) -> bool:
+        self.calls.append(("is_output_on", channel))
+        return self.output_states.get(channel, False)
+
+    def apply_voltage(
+        self,
+        *,
+        channel: int,
+        voltage: float,
+        profile: DCVoltageProfile,
+    ) -> None:
+        self.calls.append(("apply_voltage", channel, voltage, profile))
+        self.voltages[channel] = voltage
+        self.output_states[channel] = True
+
+    def apply_voltage_immediately(
+        self,
+        *,
+        channel: int,
+        voltage: float,
+        profile: DCVoltageProfile,
+    ) -> None:
+        self.calls.append(("apply_voltage_immediately", channel, voltage, profile))
+        self.voltages[channel] = voltage
+        self.output_states[channel] = True
+
+    def shutdown(self, *, channel: int, profile: DCVoltageProfile) -> None:
+        self.calls.append(("shutdown", channel, profile))
+        try:
+            if self.fail_set_voltage:
+                raise RuntimeError("restore failed")
+            self.voltages[channel] = profile.safe_voltage_v
+        finally:
+            self.output_states[channel] = False
+
+
+class _SystemManager:
+    def __init__(
+        self,
+        dc_controller: _DCVoltageController,
+        mux_to_channel: dict[int, int] | None = None,
+    ) -> None:
+        self.dc_voltage_controller = dc_controller
+        self.experiment_system = _ExperimentSystem()
+        self.mux_to_channel = mux_to_channel or {}
+
+    def resolve_dc_voltage_channel(self, mux_index: int) -> int:
+        return self.mux_to_channel.get(mux_index, mux_index + 1)
+
+    def resolve_dc_voltage_profile(self, mux_index: int) -> DCVoltageProfile:
+        return DCVoltageProfile(
+            channel=self.resolve_dc_voltage_channel(mux_index),
+            ramp_rate_v_per_s=1.0,
+            update_interval_s=0.1,
+            safe_voltage_v=0.0,
+            readback_tolerance_v=0.002,
+        )
+
+
+class _ContextForTest(ExperimentContext):
+    def __init__(
+        self,
+        *,
+        mux_labels: list[str],
+        dc_controller: _DCVoltageController,
+        mux_to_channel: dict[int, int] | None = None,
+    ) -> None:
+        self._mux_labels_for_test = mux_labels
+        self._system_manager_for_test = _SystemManager(
+            dc_controller,
+            mux_to_channel,
+        )
+
+    @property
+    def mux_labels(self) -> list[str]:
+        return self._mux_labels_for_test
+
+    @property
+    def system_manager(self) -> _SystemManager:
+        return self._system_manager_for_test
+
+
+def test_dc_voltage_control_uses_configured_channel_mapping() -> None:
+    """Given a mapped mux, DC control should use and turn off the mapped channel."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(
+        mux_labels=["MUX06"],
+        dc_controller=dc_controller,
+        mux_to_channel={6: 1},
+    )
+
+    with ctx.dc_voltage_control() as dc:
+        dc.apply_voltage(0.5)
+        assert dc_controller.voltages[1] == pytest.approx(0.5)
+        assert dc_controller.output_states[1] is True
+
+    assert dc_controller.output_states[1] is False
+
+
+@pytest.mark.parametrize(
+    ("controller_state", "output", "is_on"),
+    [(False, "off", False), (True, "on", True)],
+)
+def test_dc_voltage_control_state_returns_mapped_controller_readback(
+    controller_state: bool,
+    output: Literal["on", "off"],
+    is_on: bool,
+) -> None:
+    """Given a mapped mux, DC state should include its channel and readback."""
+    dc_controller = _DCVoltageController()
+    dc_controller.voltages[1] = 0.54
+    dc_controller.output_states[1] = controller_state
+    ctx = _ContextForTest(
+        mux_labels=["MUX06"],
+        dc_controller=dc_controller,
+        mux_to_channel={6: 1},
+    )
+
+    with ctx.dc_voltage_control() as dc:
+        state = dc.state
+
+    assert state.mux_label == "MUX06"
+    assert state.mux_index == 6
+    assert state.channel == 1
+    assert state.voltage == pytest.approx(0.54)
+    assert state.output == output
+    assert state.is_on is is_on
+
+
+def test_get_dc_voltage_state_reads_without_changing_output() -> None:
+    """DC state retrieval should read the mapped output without changing it."""
+    dc_controller = _DCVoltageController()
+    dc_controller.voltages[1] = 0.54
+    dc_controller.output_states[1] = True
+    ctx = _ContextForTest(
+        mux_labels=["MUX06"],
+        dc_controller=dc_controller,
+        mux_to_channel={6: 1},
+    )
+
+    state = ctx.get_dc_voltage_state(mux=6)
+
+    assert state.voltage == pytest.approx(0.54)
+    assert state.output == "on"
+    assert dc_controller.calls == [("is_output_on", 1), ("get_voltage", 1)]
+
+
+def test_dc_voltage_control_requires_mux_when_multiple_are_active() -> None:
+    """Given multiple active muxes, omitted mux should raise."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(
+        mux_labels=["MUX06", "MUX07"],
+        dc_controller=dc_controller,
+    )
+
+    with (
+        pytest.raises(ValueError, match="multiple active muxes"),
+        ctx.dc_voltage_control(),
+    ):
+        pass
+
+
+def test_dc_voltage_control_sweeps_states_and_turns_off_on_exit() -> None:
+    """Given a DC control, sweep should yield readback states and turn off on exit."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(mux_labels=["MUX06"], dc_controller=dc_controller)
+
+    with ctx.dc_voltage_control() as dc:
+        states = list(dc.sweep(sweep_range=[0.1, 0.2]))
+
+        assert [state.voltage for state in states] == pytest.approx([0.1, 0.2])
+        assert all(state.output == "on" for state in states)
+        assert dc_controller.output_states[7] is True
+
+    assert dc_controller.output_states[7] is False
+    assert dc_controller.voltages[7] == pytest.approx(0.0)
+
+
+def test_dc_voltage_control_applies_voltage_with_configured_ramp() -> None:
+    """Applying voltage should delegate the configured profile to the controller."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(mux_labels=["MUX06"], dc_controller=dc_controller)
+
+    with ctx.dc_voltage_control(shutdown_on_exit=False) as dc:
+        state = dc.apply_voltage(0.25)
+
+    assert state.voltage == pytest.approx(0.25)
+    assert state.is_on
+    apply_call = next(
+        call for call in dc_controller.calls if call[0] == "apply_voltage"
+    )
+    assert apply_call[1:3] == (7, 0.25)
+    applied_profile = apply_call[3]
+    assert isinstance(applied_profile, DCVoltageProfile)
+    assert applied_profile.ramp_rate_v_per_s == pytest.approx(1.0)
+    assert applied_profile.update_interval_s == pytest.approx(0.1)
+
+
+def test_dc_voltage_control_ramps_to_safe_voltage_before_turning_off() -> None:
+    """Context exit should ramp to the configured safe voltage before output off."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(mux_labels=["MUX06"], dc_controller=dc_controller)
+
+    with ctx.dc_voltage_control() as dc:
+        dc.apply_voltage(0.25)
+
+    assert dc_controller.voltages[7] == pytest.approx(0.0)
+    assert dc_controller.calls[-1][0:2] == ("shutdown", 7)
+
+
+def test_dc_voltage_control_can_apply_voltage_immediately() -> None:
+    """Explicit immediate application should skip intermediate ramp setpoints."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(mux_labels=["MUX06"], dc_controller=dc_controller)
+
+    with ctx.dc_voltage_control(shutdown_on_exit=False) as dc:
+        state = dc.apply_voltage_immediately(0.2)
+
+    assert any(call[0] == "apply_voltage_immediately" for call in dc_controller.calls)
+    assert state.is_on
+
+
+def test_dc_voltage_control_can_keep_output_on_after_exit() -> None:
+    """Given shutdown disabled, context exit should leave the output enabled."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(mux_labels=["MUX06"], dc_controller=dc_controller)
+
+    with ctx.dc_voltage_control(shutdown_on_exit=False) as dc:
+        dc.apply_voltage(0.2)
+
+    assert dc_controller.voltages[7] == pytest.approx(0.2)
+    assert dc_controller.output_states[7] is True
+    assert all(call[0] != "shutdown" for call in dc_controller.calls)
+
+
+def test_dc_voltage_control_turns_off_when_ramp_restore_fails() -> None:
+    """Given a restore failure, context exit should still turn the output off."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(mux_labels=["MUX06"], dc_controller=dc_controller)
+
+    def exit_with_failed_restore() -> None:
+        with ctx.dc_voltage_control() as dc:
+            dc.apply_voltage(0.2)
+            dc_controller.fail_set_voltage = True
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        exit_with_failed_restore()
+
+    assert dc_controller.calls[-1][0:2] == ("shutdown", 7)
+
+
+def test_dc_voltage_control_turns_off_after_partial_sweep() -> None:
+    """Given a partial DC sweep, exiting its control should turn off the output."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(mux_labels=["MUX06"], dc_controller=dc_controller)
+
+    with ctx.dc_voltage_control() as dc:
+        states = dc.sweep(sweep_range=[0.1, 0.2])
+        assert next(states).voltage == pytest.approx(0.1)
+
+    assert dc_controller.output_states[7] is False
+
+
+def test_dc_voltage_control_sets_and_reads_bound_mux() -> None:
+    """Given a bound DC control, set and state should use the selected mux."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(
+        mux_labels=["MUX06", "MUX07"],
+        dc_controller=dc_controller,
+    )
+
+    with ctx.dc_voltage_control(mux=7) as dc:
+        state = dc.apply_voltage(0.4)
+
+        assert state == dc.state
+        assert state.mux_label == "MUX07"
+        assert state.channel == 8
+        assert state.voltage == pytest.approx(0.4)
+        assert state.is_on
+
+    assert dc_controller.output_states[8] is False
+
+
+def test_dc_voltage_control_turns_bound_output_off_and_on() -> None:
+    """Given a bound control, output operations should use its resolved channel."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(
+        mux_labels=["MUX06", "MUX07"],
+        dc_controller=dc_controller,
+    )
+
+    with ctx.dc_voltage_control(mux=7) as dc:
+        dc.apply_voltage(0.4)
+
+        off_state = dc.turn_off()
+        on_state = dc.turn_on()
+
+        assert off_state.output == "off"
+        assert on_state.output == "on"
+        assert off_state.channel == on_state.channel == 8
+
+    assert dc_controller.output_states[8] is False
+
+
+def test_dc_voltage_control_uses_configured_readback_tolerance() -> None:
+    """Voltage application should delegate an overridden readback tolerance."""
+    dc_controller = _DCVoltageController()
+    ctx = _ContextForTest(mux_labels=["MUX06"], dc_controller=dc_controller)
+
+    with ctx.dc_voltage_control(shutdown_on_exit=False) as dc:
+        state = dc.apply_voltage_immediately(0.5, tolerance=0.0015)
+
+    assert state.voltage == pytest.approx(0.5)
+    call = next(
+        call for call in dc_controller.calls if call[0] == "apply_voltage_immediately"
+    )
+    applied_profile = call[3]
+    assert isinstance(applied_profile, DCVoltageProfile)
+    assert applied_profile.readback_tolerance_v == pytest.approx(0.0015)

@@ -51,6 +51,7 @@ from qubex.typing import ConfigurationMode, TargetMap
 from qubex.version import get_version
 
 from . import experiment_tool
+from .dc_voltage_control import DCVoltageControl
 from .experiment_constants import (
     CALIBRATION_VALID_DAYS,
     CLASSIFIER_DIR,
@@ -63,6 +64,7 @@ from .experiment_constants import (
 from .experiment_exceptions import CalibrationMissingError
 from .experiment_util import ExperimentUtil
 from .models.calibration_note import CalibrationNote
+from .models.dc_voltage_state import DCVoltageState
 from .models.experiment_note import ExperimentNote
 from .models.experiment_record import ExperimentRecord
 from .models.rabi_param import RabiParam
@@ -1201,6 +1203,97 @@ class ExperimentContext:
         else:
             with self.system_manager.modified_frequencies(frequencies):
                 yield
+
+    def _resolve_dc_mux(self, mux: int | str | None = None) -> Mux:
+        """Resolve the mux used for DC voltage operations."""
+        if mux is not None:
+            return self.experiment_system.get_mux(mux)
+        mux_labels = self.mux_labels
+        if len(mux_labels) != 1:
+            raise ValueError(
+                "`mux` must be specified when there are multiple active muxes."
+            )
+        return self.experiment_system.get_mux(mux_labels[0])
+
+    def _resolve_dc_output(self, mux: int | str | None) -> tuple[Mux, int]:
+        """Resolve one mux and its configured DC output channel."""
+        resolved_mux = self._resolve_dc_mux(mux)
+        channel = self.system_manager.resolve_dc_voltage_channel(resolved_mux.index)
+        return resolved_mux, channel
+
+    def get_dc_voltage_state(
+        self,
+        *,
+        mux: int | str | None = None,
+    ) -> DCVoltageState:
+        """Return DC voltage and output-state readback for one mux."""
+        resolved_mux, channel = self._resolve_dc_output(mux)
+        controller = self.system_manager.dc_voltage_controller
+        output = "on" if controller.is_output_on(channel=channel) else "off"
+        return DCVoltageState(
+            mux_label=resolved_mux.label,
+            mux_index=resolved_mux.index,
+            channel=channel,
+            voltage=controller.get_voltage(channel=channel),
+            output=output,
+        )
+
+    def _turn_off_dc(
+        self,
+        *,
+        mux: int | str | None = None,
+    ) -> None:
+        """Turn off DC output for one mux."""
+        _, channel = self._resolve_dc_output(mux)
+        self.system_manager.dc_voltage_controller.off(channel=channel)
+
+    def _turn_on_dc(
+        self,
+        *,
+        mux: int | str | None = None,
+    ) -> None:
+        """Turn on DC output for one mux."""
+        _, channel = self._resolve_dc_output(mux)
+        self.system_manager.dc_voltage_controller.on(channel=channel)
+
+    @contextmanager
+    def dc_voltage_control(
+        self,
+        *,
+        mux: int | str | None = None,
+        shutdown_on_exit: bool = True,
+    ) -> Iterator[DCVoltageControl]:
+        """Yield DC voltage operations bound to one mux."""
+        resolved_mux = self._resolve_dc_mux(mux)
+        profile = self.system_manager.resolve_dc_voltage_profile(resolved_mux.index)
+        controller = self.system_manager.dc_voltage_controller
+        control = DCVoltageControl(
+            apply_voltage=lambda voltage, resolved_profile: controller.apply_voltage(
+                channel=profile.channel,
+                voltage=voltage,
+                profile=resolved_profile,
+            ),
+            apply_voltage_immediately=lambda voltage, resolved_profile: (
+                controller.apply_voltage_immediately(
+                    channel=profile.channel,
+                    voltage=voltage,
+                    profile=resolved_profile,
+                )
+            ),
+            shutdown=lambda resolved_profile: controller.shutdown(
+                channel=profile.channel,
+                profile=resolved_profile,
+            ),
+            get_state=lambda: self.get_dc_voltage_state(mux=resolved_mux.index),
+            turn_on=lambda: self._turn_on_dc(mux=resolved_mux.index),
+            turn_off=lambda: self._turn_off_dc(mux=resolved_mux.index),
+            profile=profile,
+        )
+        try:
+            yield control
+        finally:
+            if shutdown_on_exit:
+                control.shutdown()
 
     def save_calib_note(
         self,

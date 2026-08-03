@@ -67,8 +67,10 @@ from qubex.typing import (
     TimeLike,
 )
 
+from .dc_voltage_control import DCVoltageControl
 from .experiment_context import ExperimentContext
 from .models.calibration_note import CalibrationNote
+from .models.dc_voltage_state import DCVoltageState
 from .models.experiment_note import ExperimentNote
 from .models.experiment_record import ExperimentRecord
 from .models.experiment_result import (
@@ -883,6 +885,44 @@ class Experiment:
         """Temporarily override target frequencies within the context."""
         with self.ctx.modified_frequencies(frequencies):
             yield
+
+    @contextmanager
+    def dc_voltage_control(
+        self,
+        *,
+        mux: int | str | None = None,
+        shutdown_on_exit: bool = True,
+    ) -> Iterator[DCVoltageControl]:
+        """
+        Yield DC voltage operations bound to one mux.
+
+        Parameters
+        ----------
+        mux : int or str, optional
+            Mux index or label. Required when multiple muxes are active.
+        shutdown_on_exit : bool
+            Whether to ramp to the safe voltage and turn off the output when
+            the context exits. Disable this only when the selected mux must
+            remain biased after the operation.
+
+        Yields
+        ------
+        DCVoltageControl
+            Operations bound to the resolved mux.
+        """
+        with self.ctx.dc_voltage_control(
+            mux=mux,
+            shutdown_on_exit=shutdown_on_exit,
+        ) as control:
+            yield control
+
+    def get_dc_voltage_state(
+        self,
+        *,
+        mux: int | str | None = None,
+    ) -> DCVoltageState:
+        """Return DC voltage and output-state readback for one mux."""
+        return self.ctx.get_dc_voltage_state(mux=mux)
 
     def save_calib_note(
         self,
