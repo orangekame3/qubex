@@ -7,12 +7,19 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from qubex.backend.backend_controller import BACKEND_KIND_QUEL1, BACKEND_KIND_QUEL3
 from qubex.backend.quel1 import Quel1BackendController
 from qubex.backend.quel3 import Quel3BackendController
+from qubex.external_devices import (
+    DCVoltageControllerConfig,
+    DCVoltageProfile,
+    ExternalDevicesConfig,
+)
+from qubex.external_devices.dc_voltage.config import DCVoltageProfileOverride
 from qubex.system.control_system import PortType
 from qubex.system.system_manager import BackendSettings, SystemManager
 
@@ -1151,6 +1158,74 @@ def test_load_uses_config_loader_backend_kind_when_backend_kind_is_omitted(
 
     assert called == [f"kind:{BACKEND_KIND_QUEL3}"]
     assert captured_load_kwargs["backend_kind"] is None
+
+
+def test_load_creates_dc_voltage_controller_from_config_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given DC controller config, manager load should install configured controller."""
+    manager = SystemManager.shared()
+    created_configs: list[DCVoltageControllerConfig] = []
+
+    class _FakeConfigLoader:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def load(self, **_: object) -> None:
+            pass
+
+        @property
+        def backend_kind(self) -> str:
+            return BACKEND_KIND_QUEL1
+
+        @property
+        def external_devices_config(self) -> ExternalDevicesConfig:
+            return ExternalDevicesConfig(
+                dc_voltage_controllers={
+                    "jpa_bias": DCVoltageControllerConfig(
+                        driver="ons61797",
+                        connection={"port": "/dev/system-dc"},
+                        voltage_defaults=DCVoltageProfile(channel=1),
+                        muxes={6: DCVoltageProfileOverride(channel=1)},
+                    )
+                }
+            )
+
+        def get_experiment_system(self) -> object:
+            return SimpleNamespace(hash=hash("TEST"))
+
+    def _fake_create_dc_voltage_controller(
+        config: DCVoltageControllerConfig,
+    ) -> object:
+        created_configs.append(config)
+        return SimpleNamespace(config=config)
+
+    monkeypatch.setattr("qubex.system.system_manager.ConfigLoader", _FakeConfigLoader)
+    monkeypatch.setattr(
+        "qubex.system.system_manager.create_dc_voltage_controller",
+        _fake_create_dc_voltage_controller,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_sync_experiment_system_to_backend_controller",
+        lambda: None,
+    )
+
+    manager.load(chip_id="TEST", mock_mode=False)
+
+    assert created_configs == [
+        DCVoltageControllerConfig(
+            driver="ons61797",
+            connection={"port": "/dev/system-dc"},
+            voltage_defaults=DCVoltageProfile(channel=1),
+            muxes={6: DCVoltageProfileOverride(channel=1)},
+        ),
+    ]
+    installed_controller = cast(Any, manager.dc_voltage_controller)
+    assert installed_controller.config == created_configs[0]
+    assert manager.resolve_dc_voltage_channel(6) == 1
+    with pytest.raises(ValueError, match=r"Mux 7 has no DC voltage channel"):
+        manager.resolve_dc_voltage_channel(7)
 
 
 def test_load_does_not_pass_wiring_file_to_config_loader(

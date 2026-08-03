@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 from qubex.experiment.experiment import Experiment
+from qubex.experiment.models.dc_voltage_state import DCVoltageState
 
 
 class _CalibrationServiceStub:
@@ -122,6 +123,28 @@ class _ExperimentContextStub:
 
     def register_custom_target(self, **kwargs: Any) -> None:
         self.calls.append(("register_custom_target", kwargs))
+
+    def get_dc_voltage_state(self, **kwargs: Any) -> DCVoltageState:
+        self.calls.append(("get_dc_voltage_state", kwargs))
+        return DCVoltageState(
+            mux_label="MUX06",
+            mux_index=6,
+            channel=1,
+            voltage=0.54,
+            output="on",
+        )
+
+    def dc_voltage_control(self, **kwargs: Any):
+        self.calls.append(("dc_voltage_control", {"enter": kwargs}))
+
+        class _Context:
+            def __enter__(_self) -> object:
+                return self
+
+            def __exit__(_self, *_: object) -> None:
+                self.calls.append(("dc_voltage_control", {"exit": kwargs}))
+
+        return _Context()
 
 
 class _SessionServiceStub:
@@ -1089,3 +1112,42 @@ def test_register_custom_target_delegates_legacy_update_lsi_to_context() -> None
             },
         )
     ]
+
+
+def test_dc_voltage_control_delegates_to_context() -> None:
+    """Given a mux, the DC control context should delegate and yield its control."""
+    exp = object.__new__(Experiment)
+    context_stub = _ExperimentContextStub()
+    exp.__dict__["_experiment_context"] = context_stub
+
+    with exp.dc_voltage_control(mux=6, shutdown_on_exit=False) as dc:
+        assert dc is context_stub
+
+    assert context_stub.calls == [
+        (
+            "dc_voltage_control",
+            {"enter": {"mux": 6, "shutdown_on_exit": False}},
+        ),
+        (
+            "dc_voltage_control",
+            {"exit": {"mux": 6, "shutdown_on_exit": False}},
+        ),
+    ]
+
+
+def test_get_dc_voltage_state_delegates_to_context() -> None:
+    """Given a mux, DC state retrieval should delegate without a control context."""
+    exp = object.__new__(Experiment)
+    context_stub = _ExperimentContextStub()
+    exp.__dict__["_experiment_context"] = context_stub
+
+    state = exp.get_dc_voltage_state(mux=6)
+
+    assert state == DCVoltageState(
+        mux_label="MUX06",
+        mux_index=6,
+        channel=1,
+        voltage=0.54,
+        output="on",
+    )
+    assert context_stub.calls == [("get_dc_voltage_state", {"mux": 6})]

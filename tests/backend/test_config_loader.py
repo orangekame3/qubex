@@ -119,7 +119,13 @@ def _make_minimal_files(tmp_path: Path) -> tuple[Path, Path, str]:
         {
             "meta": {},
             "data": {
-                0: {"pump_frequency": 12.3, "pump_amplitude": 0.1, "dc_voltage": 0.2},
+                0: {
+                    "pump_frequency": 12.3,
+                    "pump_amplitude": 0.1,
+                    "dc_voltage": 0.2,
+                    "low_noise_dc_voltage": -0.08,
+                    "dc_voltage_exit_mode": "low_noise",
+                },
                 1: None,
             },
         },
@@ -555,6 +561,8 @@ def test_control_params_sources_and_jpa_passthrough(tmp_path: Path):
         "pump_frequency": 12.3,
         "pump_amplitude": 0.1,
         "dc_voltage": 0.2,
+        "low_noise_dc_voltage": -0.08,
+        "dc_voltage_exit_mode": "low_noise",
     }
     assert cp.jpa_params.get(1) == {
         "pump_frequency": DEFAULT_PUMP_FREQUENCY_GHZ,
@@ -562,6 +570,11 @@ def test_control_params_sources_and_jpa_passthrough(tmp_path: Path):
         "dc_voltage": 0.0,
     }
     assert math.isclose(cp.get_pump_frequency(0), 12.3, rel_tol=0, abs_tol=1e-12)
+    assert cp.get_low_noise_dc_voltage(0) == pytest.approx(-0.08)
+    assert cp.get_dc_voltage_exit_mode(0) == "low_noise"
+    assert cp.get_dc_voltage_exit_mode(1) == "off"
+    with pytest.raises(ValueError, match="low-noise DC voltage"):
+        cp.get_low_noise_dc_voltage(1)
     assert math.isclose(
         cp.get_pump_frequency(1),
         DEFAULT_PUMP_FREQUENCY_GHZ,
@@ -573,6 +586,30 @@ def test_control_params_sources_and_jpa_passthrough(tmp_path: Path):
     assert math.isclose(
         cp.get_frequency_margin("CTRL_GE"), 0.1, rel_tol=0, abs_tol=1e-12
     )
+
+
+def test_jpa_params_reject_unknown_dc_voltage_exit_mode(tmp_path: Path) -> None:
+    """JPA parameters should reject an unsupported DC voltage exit mode."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        params_dir / "jpa_params.yaml",
+        {
+            "meta": {},
+            "data": {
+                0: {
+                    "dc_voltage": 0.2,
+                    "dc_voltage_exit_mode": "unknown",
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="dc_voltage_exit_mode"):
+        ConfigLoader(
+            system_id=chip_id,
+            config_dir=config_dir,
+            params_dir=params_dir,
+        ).get_experiment_system()
 
 
 def test_get_experiment_system_deprecation_warning(tmp_path: Path):
@@ -2269,3 +2306,189 @@ def test_load_uses_quel1_system_loader_when_backend_is_unset(
     loader.load()
 
     assert called == ["clock", "control", "wiring"]
+
+
+def test_external_devices_config_loads_dc_controller_profiles(
+    tmp_path: Path,
+) -> None:
+    """External device settings should expose resolved DC voltage profiles."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "external_devices.yaml",
+        {
+            "dc_voltage_controllers": {
+                "jpa_bias": {
+                    "driver": "ons61797",
+                    "connection": {"port": "/dev/system-dc"},
+                    "voltage_control": {
+                        "defaults": {
+                            "ramp": {
+                                "rate_v_per_s": 0.1,
+                                "step_interval_s": 0.1,
+                            },
+                            "shutdown": {"voltage_v": 0.0},
+                            "readback": {
+                                "tolerance_v": 0.001,
+                                "max_attempts": 5,
+                            },
+                        },
+                        "muxes": {
+                            6: {"channel": 1},
+                            7: {
+                                "channel": 2,
+                                "ramp": {"rate_v_per_s": 0.05},
+                                "readback": {"tolerance_v": 0.002},
+                            },
+                        },
+                    },
+                }
+            }
+        },
+    )
+
+    loader = ConfigLoader(
+        chip_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    )
+
+    controller = loader.external_devices_config.dc_voltage_controllers["jpa_bias"]
+    assert controller.driver == "ons61797"
+    assert controller.connection == {"port": "/dev/system-dc"}
+    assert controller.resolve_voltage_profile(6).channel == 1
+    assert controller.resolve_voltage_profile(6).ramp_rate_v_per_s == pytest.approx(0.1)
+    assert controller.resolve_voltage_profile(6).readback_tolerance_v == pytest.approx(
+        0.001
+    )
+    assert controller.resolve_voltage_profile(6).max_set_attempts == 5
+    assert controller.resolve_voltage_profile(7).channel == 2
+    assert controller.resolve_voltage_profile(7).ramp_rate_v_per_s == pytest.approx(
+        0.05
+    )
+    assert controller.resolve_voltage_profile(7).readback_tolerance_v == pytest.approx(
+        0.002
+    )
+
+
+def test_external_devices_config_defaults_when_missing(
+    tmp_path: Path,
+) -> None:
+    """Missing external device settings should expose a default JPA controller."""
+    config_dir, params_dir, _ = _make_minimal_files(tmp_path)
+
+    loader = ConfigLoader(
+        chip_id="TESTCHIP",
+        config_dir=config_dir,
+        params_dir=params_dir,
+    )
+
+    controller = loader.external_devices_config.dc_voltage_controllers["jpa_bias"]
+    assert controller.driver == "ons61797"
+    assert controller.connection == {}
+    with pytest.raises(ValueError, match=r"Mux 6 has no DC voltage channel"):
+        controller.resolve_voltage_profile(6)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (
+            ("voltage_control", "defaults", "ramp", "rate_v_per_s"),
+            0.0,
+            "rate_v_per_s.*positive",
+        ),
+        (
+            ("voltage_control", "defaults", "readback", "tolerance_v"),
+            -0.1,
+            "tolerance_v.*non-negative",
+        ),
+        (
+            ("voltage_control", "defaults", "readback", "max_attempts"),
+            0,
+            "max_attempts.*positive",
+        ),
+    ],
+)
+def test_external_devices_config_rejects_invalid_control_values(
+    tmp_path: Path,
+    path: tuple[str, ...],
+    value: object,
+    match: str,
+) -> None:
+    """Invalid nested DC control values should be rejected."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    controller: dict[str, object] = {}
+    current = controller
+    for key in path[:-1]:
+        child: dict[str, object] = {}
+        current[key] = child
+        current = child
+    current[path[-1]] = value
+    _write_yaml(
+        config_dir / "external_devices.yaml",
+        {"dc_voltage_controllers": {"jpa_bias": controller}},
+    )
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        ConfigLoader(
+            chip_id=chip_id,
+            config_dir=config_dir,
+            params_dir=params_dir,
+        )
+
+
+def test_external_devices_config_rejects_non_string_driver(
+    tmp_path: Path,
+) -> None:
+    """A non-string external DC driver should be rejected."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "external_devices.yaml",
+        {"dc_voltage_controllers": {"jpa_bias": {"driver": 123}}},
+    )
+
+    with pytest.raises(TypeError, match=r"driver.*string"):
+        ConfigLoader(
+            chip_id=chip_id,
+            config_dir=config_dir,
+            params_dir=params_dir,
+        )
+
+
+@pytest.mark.parametrize(
+    ("muxes", "match"),
+    [
+        ({6: {"channel": "one"}}, "must be integers"),
+        (
+            {6: {"channel": 1}, 7: {"channel": 1}},
+            "must not contain duplicate channels",
+        ),
+        ({"MUX06": {"channel": 1}}, "integer mux indices"),
+    ],
+)
+def test_external_devices_config_rejects_invalid_mux_profiles(
+    tmp_path: Path,
+    muxes: dict[object, object],
+    match: str,
+) -> None:
+    """Invalid external DC mux profiles should be rejected."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "external_devices.yaml",
+        {
+            "dc_voltage_controllers": {
+                "jpa_bias": {
+                    "voltage_control": {
+                        "muxes": muxes,
+                    }
+                }
+            },
+        },
+    )
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        ConfigLoader(
+            chip_id=chip_id,
+            config_dir=config_dir,
+            params_dir=params_dir,
+        )

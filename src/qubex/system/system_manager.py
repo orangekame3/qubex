@@ -25,6 +25,13 @@ from qubex.backend.quel3 import Quel3BackendController
 from qubex.constants import (
     DEFAULT_RAWDATA_DIR,
 )
+from qubex.external_devices import (
+    DCVoltageController,
+    DCVoltageControllerConfig,
+    DCVoltageProfile,
+    ExternalDevicesConfig,
+    create_dc_voltage_controller,
+)
 from qubex.typing import ConfigurationMode
 
 from .config_loader import ConfigLoader
@@ -149,6 +156,8 @@ class SystemManager:
         self._experiment_system = None
         self._backend_controller: SystemBackendController | None = None
         self._system_synchronizer: SystemSynchronizer | None = None
+        self._dc_voltage_controller = create_dc_voltage_controller()
+        self._dc_voltage_controller_config = DCVoltageControllerConfig()
         self._backend_settings: BackendSettings = BackendSettings()
         self._cached_state = SystemState(0, 0, 0)
         self._rawdata_dir = None
@@ -173,6 +182,19 @@ class SystemManager:
         if isinstance(backend_controller, Quel3BackendController):
             return BACKEND_KIND_QUEL3
         return None
+
+    @property
+    def dc_voltage_controller(self) -> DCVoltageController:
+        """Return configured DC voltage controller for the active system."""
+        return self._dc_voltage_controller
+
+    def resolve_dc_voltage_channel(self, mux_index: int) -> int:
+        """Resolve a one-based DC channel for one mux index."""
+        return self.resolve_dc_voltage_profile(mux_index).channel
+
+    def resolve_dc_voltage_profile(self, mux_index: int) -> DCVoltageProfile:
+        """Resolve voltage-control settings for one mux index."""
+        return self._dc_voltage_controller_config.resolve_voltage_profile(mux_index)
 
     def set_backend_kind(self, backend_kind: BackendKind) -> None:
         """
@@ -354,6 +376,21 @@ class SystemManager:
                 backend_controller,
             )
             self._backend_settings = BackendSettings()
+        external_devices_config = getattr(
+            next_config_loader,
+            "external_devices_config",
+            ExternalDevicesConfig(),
+        )
+        dc_voltage_config = external_devices_config.dc_voltage_controllers.get(
+            "jpa_bias"
+        )
+        if dc_voltage_config is None:
+            raise ValueError(
+                "`external_devices.yaml` must define the `jpa_bias` "
+                "DC voltage controller."
+            )
+        self._dc_voltage_controller = create_dc_voltage_controller(dc_voltage_config)
+        self._dc_voltage_controller_config = dc_voltage_config
         self._config_loader = next_config_loader
         self._mock_mode = mock_mode
         self._experiment_system = next_experiment_system
