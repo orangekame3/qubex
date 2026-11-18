@@ -29,8 +29,8 @@ from qubex.experiment.services.characterization_service import (
 )
 from qubex.pulse import FlatTop, Gaussian, PulseSchedule
 
-ReadoutGrouping = Literal["multiplexed", "subgroups"]
-_READOUT_GROUPINGS: tuple[ReadoutGrouping, ...] = ("multiplexed", "subgroups")
+ReadoutGrouping = Literal["multiplexed", "frequency_pairs"]
+_READOUT_GROUPINGS: tuple[ReadoutGrouping, ...] = ("multiplexed", "frequency_pairs")
 
 
 def multiplexed_readout_qubit_spectroscopy(
@@ -89,14 +89,16 @@ def multiplexed_readout_qubit_spectroscopy(
     simultaneous_drive : bool | None, optional
         Whether readout starts with the drive pulse. False starts readout after
         the drive pulse ends. Defaults to True.
-    readout_grouping : {"multiplexed", "subgroups"} | None, optional
+    readout_grouping : {"multiplexed", "frequency_pairs"} | None, optional
         How candidates are split into simultaneously read groups.
-        `"multiplexed"` reads every candidate in one group. `"subgroups"`
-        applies `exp.util.create_qubit_subgroups` to the candidates' qubit
-        labels, so candidates whose qubit index modulo 4 is 0 or 3 are read
-        first and those with 1 or 2 second; empty groups are skipped. The
-        full drive sweep is repeated for each group. Defaults to
-        `"subgroups"`.
+        `"multiplexed"` reads every candidate in one group.
+        `"frequency_pairs"` sorts candidates by readout frequency, ties kept
+        in candidate order, and reads adjacent pairs from the lowest
+        frequency up; with an odd count the highest candidate is read alone.
+        Groups depend only on candidate frequencies, not on slot labels or
+        qubit indices, because candidates are not yet assigned to qubits.
+        The full drive sweep is repeated for each group. Defaults to
+        `"frequency_pairs"`.
     shots : int | None, optional
         Number of averaged shots per sweep point. Defaults to `DEFAULT_SHOTS`.
     interval : float | None, optional
@@ -118,7 +120,7 @@ def multiplexed_readout_qubit_spectroscopy(
         - `simultaneous_drive`: applied timing mode.
         - `readout_grouping`: applied grouping mode.
         - `readout_groups`: readout labels of each measured group, in
-          execution order.
+          execution order, each listed in candidate order.
         - `shots` and `interval`: applied averaging settings.
         - `candidates`: mapping from readout label to a payload with
           `readout_label`, `candidate_index` (position among all
@@ -140,7 +142,9 @@ def multiplexed_readout_qubit_spectroscopy(
         If labels cannot be resolved, candidates are empty or duplicated, a
         value is non-finite or out of range, a candidate has no readout
         amplitude, `readout_grouping` is unknown, or a readout group cannot be
-        realized under one readout configuration.
+        realized under one readout configuration. The message names the
+        group's same-mux frequencies, their span, and the windows the backend
+        planner split them into.
 
     Notes
     -----
@@ -150,8 +154,9 @@ def multiplexed_readout_qubit_spectroscopy(
     readout and capture settings shared within a mux are centered on all of
     them. A group whose candidates cannot be realized under one readout
     configuration is rejected before any hardware change; use
-    `readout_grouping="subgroups"` (the default) or fewer candidates in that
-    case. The
+    `readout_grouping="frequency_pairs"` (the default), which keeps each
+    group's frequencies close together, or fewer candidates in that case.
+    The
     drive target's carrier settings are then retuned segment by segment
     inside the readout configuration. Readout and drive configurations are
     planned before hardware access and restored in reverse order on exit,
@@ -188,9 +193,9 @@ def multiplexed_readout_qubit_spectroscopy(
     if save_image is None:
         save_image = False
     if readout_grouping is None:
-        readout_grouping = "subgroups"
+        readout_grouping = "frequency_pairs"
     if readout_grouping not in _READOUT_GROUPINGS:
-        raise ValueError("readout_grouping must be 'multiplexed' or 'subgroups'.")
+        raise ValueError("readout_grouping must be 'multiplexed' or 'frequency_pairs'.")
     if int(shots) <= 0:
         raise ValueError("shots must be positive.")
 
@@ -209,7 +214,7 @@ def multiplexed_readout_qubit_spectroscopy(
     drive_amplitudes = np.sqrt(10 ** (powers / 10))
 
     readout_groups = _resolve_readout_groups(
-        exp, readout_labels, data_keys, readout_grouping
+        readout_labels, candidate_frequencies, readout_grouping
     )
     group_indices = {
         label: index for index, group in enumerate(readout_groups) for label in group
@@ -407,28 +412,21 @@ def _resolve_readout_amplitudes(
 
 
 def _resolve_readout_groups(
-    exp: Experiment,
     readout_labels: list[str],
-    data_keys: Mapping[str, str],
+    candidate_frequencies: Mapping[str, float],
     readout_grouping: ReadoutGrouping,
 ) -> list[list[str]]:
-    """Return non-empty readout groups in candidate order for the grouping mode."""
+    """Return readout groups in execution order, each in candidate order."""
     if readout_grouping == "multiplexed":
         return [list(readout_labels)]
-    labels_by_qubit = {data_keys[label]: label for label in readout_labels}
-    subgroups = exp.util.create_qubit_subgroups(list(labels_by_qubit))
-    groups: list[list[str]] = []
-    for subgroup in subgroups:
-        members = set(subgroup)
-        group = [label for label in readout_labels if data_keys[label] in members]
-        if group:
-            groups.append(group)
-    grouped = [label for group in groups for label in group]
-    if sorted(grouped) != sorted(readout_labels):
-        raise ValueError(
-            "Qubit subgroups must assign every readout candidate exactly once."
-        )
-    return groups
+    order = {label: index for index, label in enumerate(readout_labels)}
+    by_frequency = sorted(
+        readout_labels, key=lambda label: (candidate_frequencies[label], order[label])
+    )
+    return [
+        sorted(by_frequency[start : start + 2], key=order.__getitem__)
+        for start in range(0, len(by_frequency), 2)
+    ]
 
 
 def _plan_readout_configurations(
@@ -446,21 +444,28 @@ def _plan_readout_configurations(
     }
     configurations: list[SweepConfiguration] = []
     for label in group:
-        frequencies = [
-            candidate_frequencies[other]
-            for other in group
-            if mux_indices[other] == mux_indices[label]
-        ]
+        members = [other for other in group if mux_indices[other] == mux_indices[label]]
+        frequencies = [candidate_frequencies[other] for other in members]
         plan = exp.ctx.system_manager.plan_frequency_sweep(label, frequencies)
         if len(plan) != 1:
             suggestion = (
-                "Use readout_grouping='subgroups' or fewer candidates."
+                "Use readout_grouping='frequency_pairs' or fewer candidates."
                 if readout_grouping == "multiplexed"
-                else "Use fewer candidates."
+                else "Read fewer candidates per call."
             )
+            tones = ", ".join(
+                f"{other}={candidate_frequencies[other]:.6f}" for other in members
+            )
+            windows = "; ".join(
+                "[" + ", ".join(members[i] for i in segment.indices) + "]"
+                for segment in plan
+            )
+            span = max(frequencies) - min(frequencies)
             raise ValueError(
                 f"Readout candidates sharing `{label}`'s mux cannot be read under "
-                f"one readout configuration. {suggestion}"
+                f"one readout configuration: frequencies {tones} GHz span "
+                f"{span * 1e3:.1f} MHz, and the backend planner splits them into "
+                f"{len(plan)} windows {windows}. {suggestion}"
             )
         configurations.append(plan[0].configuration)
     return configurations

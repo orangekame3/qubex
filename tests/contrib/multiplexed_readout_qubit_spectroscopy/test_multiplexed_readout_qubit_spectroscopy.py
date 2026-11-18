@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -11,10 +12,16 @@ import pytest
 from numpy.testing import assert_allclose
 
 from qubex import contrib
+from qubex.backend.quel1.managers.frequency_configuration_manager import (
+    Quel1FrequencyConfigurationManager,
+)
+from qubex.backend.quel1.sweep_configuration import Quel1SweepConfiguration
 from qubex.contrib.experiment.multiplexed_readout_qubit_spectroscopy import (
     multiplexed_readout_qubit_spectroscopy,
 )
 from qubex.experiment.models.result import Result
+from qubex.system.quel1.quel1_system_synchronizer import Quel1SystemSynchronizer
+from qubex.system.system_manager import SystemManager
 
 QUBITS = ["Q00", "Q01", "Q02", "Q03", "Q04"]
 READOUT_FREQUENCIES = {
@@ -141,10 +148,12 @@ class _MeasurementService:
         self.fail_on_call = fail_on_call
         self.calls: list[dict[str, Any]] = []
         self.stacks: list[list[str]] = []
+        self.on_execute: Any = lambda _kwargs: None
 
     def execute(self, **kwargs: Any) -> _MeasurementResult:
         self.calls.append(kwargs)
         self.stacks.append(list(self.ctx.system_manager.stack))
+        self.on_execute(kwargs)
         if self.fail_on_call is not None and len(self.calls) == self.fail_on_call:
             raise RuntimeError("hardware failure")
         schedule = kwargs["schedule"]
@@ -165,18 +174,10 @@ class _MeasurementService:
 
 
 class _Util:
-    """Mirror `ExperimentUtil.create_qubit_subgroups` diagonal grouping by index."""
-
-    def __init__(self) -> None:
-        self.subgroup_calls: list[list[str]] = []
+    """Fail if the helper falls back to qubit-index subgroups."""
 
     def create_qubit_subgroups(self, qubits: Any) -> list[list[str]]:
-        labels = list(qubits)
-        self.subgroup_calls.append(labels)
-        return [
-            [q for q in labels if int(q[1:]) % 4 in [0, 3]],
-            [q for q in labels if int(q[1:]) % 4 in [1, 2]],
-        ]
+        raise AssertionError("readout candidates must not be grouped by qubit index")
 
 
 class _Experiment:
@@ -484,11 +485,10 @@ def test_rejects_invalid_grouping_before_planning() -> None:
     """An unknown readout grouping is rejected before any sweep is planned."""
     exp = _Experiment()
 
-    with pytest.raises(ValueError, match="'multiplexed' or 'subgroups'"):
-        _run(exp, readout_grouping="pairs")
+    with pytest.raises(ValueError, match="'multiplexed' or 'frequency_pairs'"):
+        _run(exp, readout_grouping="subgroups")
 
     assert exp.ctx.system_manager.plan_calls == []
-    assert exp.util.subgroup_calls == []
 
 
 def test_rejects_candidate_without_default_amplitude() -> None:
@@ -509,15 +509,14 @@ def test_is_exported_from_contrib() -> None:
     )
 
 
-def test_default_grouping_reads_candidates_in_qubit_subgroups() -> None:
-    """By default candidates are read in the experiment's qubit subgroups."""
+def test_default_grouping_reads_frequency_adjacent_pairs() -> None:
+    """By default the two lowest and the two highest candidates are read together."""
     exp = _Experiment()
 
     result = _run(exp)
 
-    assert result.data["readout_grouping"] == "subgroups"
-    assert result.data["readout_groups"] == [["RQ00", "RQ03"], ["RQ01", "RQ02"]]
-    assert exp.util.subgroup_calls == [["Q00", "Q01", "Q02", "Q03"]]
+    assert result.data["readout_grouping"] == "frequency_pairs"
+    assert result.data["readout_groups"] == [["RQ01", "RQ03"], ["RQ00", "RQ02"]]
 
 
 def test_explicit_multiplexed_grouping_reads_every_candidate_in_one_group() -> None:
@@ -528,7 +527,6 @@ def test_explicit_multiplexed_grouping_reads_every_candidate_in_one_group() -> N
 
     assert result.data["readout_grouping"] == "multiplexed"
     assert result.data["readout_groups"] == [["RQ00", "RQ01", "RQ02", "RQ03"]]
-    assert exp.util.subgroup_calls == []
     for label in READOUT_FREQUENCIES:
         assert result.data["candidates"][label]["readout_group_index"] == 0
 
@@ -571,9 +569,9 @@ def test_readout_plans_use_only_same_mux_candidates() -> None:
 @pytest.mark.parametrize(
     ("grouping", "expected_groups"),
     [
-        (None, [["RQ00", "RQ03"], ["RQ01", "RQ02"]]),
+        (None, [["RQ01", "RQ03"], ["RQ00", "RQ02"]]),
         ("multiplexed", [["RQ00", "RQ01", "RQ02", "RQ03"]]),
-        ("subgroups", [["RQ00", "RQ03"], ["RQ01", "RQ02"]]),
+        ("frequency_pairs", [["RQ01", "RQ03"], ["RQ00", "RQ02"]]),
     ],
 )
 def test_grouping_modes_select_measured_readouts(
@@ -595,26 +593,52 @@ def test_grouping_modes_select_measured_readouts(
     assert result.data["readout_groups"] == expected_groups
 
 
-def test_subgroups_reuse_experiment_qubit_subgroups() -> None:
-    """Subgroup mode applies the experiment's qubit subgroups to candidate qubits."""
+@pytest.mark.parametrize(
+    ("frequencies", "expected_groups"),
+    [
+        ({"RQ02": 7.1}, [["RQ02"]]),
+        ({"RQ03": 7.4, "RQ00": 7.1}, [["RQ03", "RQ00"]]),
+        ({"RQ02": 7.3, "RQ00": 7.1, "RQ01": 7.2}, [["RQ00", "RQ01"], ["RQ02"]]),
+        (
+            {"RQ00": 7.2, "RQ01": 7.2, "RQ02": 7.1, "RQ03": 7.2, "RQ04": 7.0},
+            [["RQ02", "RQ04"], ["RQ00", "RQ01"], ["RQ03"]],
+        ),
+    ],
+)
+def test_frequency_pairs_cover_odd_counts_and_ties(
+    frequencies: dict[str, float], expected_groups: list[list[str]]
+) -> None:
+    """Pairs ascend by frequency, ties keep candidate order, and none is omitted."""
     exp = _Experiment()
 
-    result = _run(exp, readout_grouping="subgroups")
+    result = _run(exp, readout_frequencies=frequencies)
 
-    assert exp.util.subgroup_calls == [["Q00", "Q01", "Q02", "Q03"]]
-    assert result.data["readout_grouping"] == "subgroups"
-    groups = {
-        label: result.data["candidates"][label]["readout_group_index"]
-        for label in READOUT_FREQUENCIES
-    }
-    assert groups == {"RQ00": 0, "RQ01": 1, "RQ02": 1, "RQ03": 0}
+    assert result.data["readout_groups"] == expected_groups
+    assert result.data["readout_labels"] == list(frequencies)
+    for index, label in enumerate(frequencies):
+        entry = result.data["candidates"][label]
+        assert entry["candidate_index"] == index
+        groups = result.data["readout_groups"]
+        assert label in groups[entry["readout_group_index"]]
 
 
-def test_subgroups_configure_readout_per_group() -> None:
-    """Each subgroup configures only its readouts from its own frequencies."""
+def test_frequency_pairs_ignore_qubit_index() -> None:
+    """Pairs follow candidate frequencies, not slot or qubit labels."""
     exp = _Experiment()
 
-    _run(exp, readout_grouping="subgroups")
+    result = _run(
+        exp,
+        readout_frequencies={"RQ00": 7.00, "RQ01": 7.40, "RQ02": 7.02, "RQ03": 7.42},
+    )
+
+    assert result.data["readout_groups"] == [["RQ00", "RQ02"], ["RQ01", "RQ03"]]
+
+
+def test_frequency_pairs_configure_readout_per_group() -> None:
+    """Each pair configures only its readouts from its own frequencies."""
+    exp = _Experiment()
+
+    _run(exp, readout_grouping="frequency_pairs")
 
     manager = exp.ctx.system_manager
     plans = {
@@ -623,23 +647,23 @@ def test_subgroups_configure_readout_per_group() -> None:
         if c["target"].startswith("R")
     }
     assert plans == {
-        "RQ00": [7.30, 7.20],
-        "RQ03": [7.30, 7.20],
-        "RQ01": [7.10, 7.40],
-        "RQ02": [7.10, 7.40],
+        "RQ01": [7.10, 7.20],
+        "RQ03": [7.10, 7.20],
+        "RQ00": [7.30, 7.40],
+        "RQ02": [7.30, 7.40],
     }
     stacks = exp.measurement_service.stacks
-    assert stacks[0] == ["readout-RQ00", "readout-RQ03", "segment-0"]
-    assert stacks[-1] == ["readout-RQ01", "readout-RQ02", "segment-0"]
+    assert stacks[0] == ["readout-RQ01", "readout-RQ03", "segment-0"]
+    assert stacks[-1] == ["readout-RQ00", "readout-RQ02", "segment-0"]
 
 
-def test_subgroups_keep_global_candidate_identity_and_order() -> None:
+def test_frequency_pairs_keep_global_candidate_identity_and_order() -> None:
     """Candidates keep input order, global index, amplitude, and their own signals."""
     exp = _Experiment()
 
     result = _run(
         exp,
-        readout_grouping="subgroups",
+        readout_grouping="frequency_pairs",
         readout_amplitudes={"RQ02": 0.25},
     )
 
@@ -665,41 +689,30 @@ def test_subgroups_keep_global_candidate_identity_and_order() -> None:
     )
 
 
-def test_subgroups_skip_empty_groups() -> None:
-    """Empty subgroups are skipped without planning or measuring."""
-    exp = _Experiment()
-
-    result = _run(
-        exp,
-        readout_grouping="subgroups",
-        readout_frequencies={"RQ01": 7.1, "RQ02": 7.4},
-    )
-
-    assert result.data["readout_groups"] == [["RQ01", "RQ02"]]
-    assert len(exp.measurement_service.calls) == 6
-
-
 def test_rejects_unrealizable_multiplexed_group_before_hardware() -> None:
-    """An unrealizable multiplexed group is rejected first with a subgroup hint."""
+    """An unrealizable multiplexed group is rejected first with a pairing hint."""
     exp = _Experiment(unrealizable_readouts={"RQ01"})
 
-    with pytest.raises(ValueError, match=r"RQ01.*readout_grouping='subgroups'"):
+    with pytest.raises(ValueError, match=r"RQ01.*readout_grouping='frequency_pairs'"):
         _run(exp, readout_grouping="multiplexed")
 
     assert exp.ctx.system_manager.entered == []
     assert exp.measurement_service.calls == []
 
 
-def test_rejects_unrealizable_subgroup_without_subgroup_hint() -> None:
-    """An unrealizable subgroup is rejected first without suggesting subgroups again."""
+def test_rejects_unrealizable_pair_with_frequency_diagnostics() -> None:
+    """An unrealizable pair is rejected first with its tones, span, and windows."""
     exp = _Experiment(unrealizable_readouts={"RQ01"})
 
     with pytest.raises(ValueError, match="RQ01") as excinfo:
         _run(exp)
 
     message = str(excinfo.value)
-    assert "subgroups" not in message
-    assert "fewer candidates" in message
+    assert "RQ01=7.100000, RQ03=7.200000 GHz" in message
+    assert "span 100.0 MHz" in message
+    assert "2 windows [RQ01]; [RQ03]" in message
+    assert "readout_grouping=" not in message
+    assert "fewer candidates per call" in message
     assert exp.ctx.system_manager.entered == []
     assert exp.measurement_service.calls == []
 
@@ -708,19 +721,19 @@ def test_restores_every_configuration_after_success() -> None:
     """Readout and drive configurations are exited in reverse order after success."""
     exp = _Experiment(segment_indices=[(0, 1), (2,)])
 
-    _run(exp, readout_grouping="subgroups")
+    _run(exp, readout_grouping="frequency_pairs")
 
     manager = exp.ctx.system_manager
     assert manager.active == 0
     assert manager.events[:8] == [
-        ("enter", "readout-RQ00"),
+        ("enter", "readout-RQ01"),
         ("enter", "readout-RQ03"),
         ("enter", "segment-0"),
         ("exit", "segment-0"),
         ("enter", "segment-1"),
         ("exit", "segment-1"),
         ("exit", "readout-RQ03"),
-        ("exit", "readout-RQ00"),
+        ("exit", "readout-RQ01"),
     ]
     assert len(manager.events) == 16
 
@@ -730,12 +743,201 @@ def test_restores_every_configuration_after_failure_in_later_group() -> None:
     exp = _Experiment(fail_on_call=7)
 
     with pytest.raises(RuntimeError, match="hardware failure"):
-        _run(exp, readout_grouping="subgroups")
+        _run(exp, readout_grouping="frequency_pairs")
 
     manager = exp.ctx.system_manager
     assert manager.active == 0
     assert manager.events[-3:] == [
         ("exit", "segment-0"),
         ("exit", "readout-RQ02"),
-        ("exit", "readout-RQ01"),
+        ("exit", "readout-RQ00"),
     ]
+
+
+class _Quel1ReadoutBackend:
+    """Hold one QuEL-1 readout mux: a generator channel and four capture runits."""
+
+    def __init__(self) -> None:
+        self.cache: dict[str, Any] = {
+            "box": {
+                "ports": {
+                    1: {
+                        "lo_freq": 8_000_000_000,
+                        "cnco_freq": 1_500_000_000,
+                        "channels": {0: {"fnco_freq": 23_437_500}},
+                    },
+                    2: {
+                        "lo_freq": 8_000_000_000,
+                        "cnco_freq": 1_500_000_000,
+                        "runits": {r: {"fnco_freq": 23_437_500} for r in range(4)},
+                    },
+                }
+            }
+        }
+        self.hardware = deepcopy(self.cache)
+
+    def get_box_config_cache(self) -> dict[str, Any]:
+        return deepcopy(self.cache)
+
+    def update_box_config_cache(self, values: dict[str, Any]) -> None:
+        self.cache.update(deepcopy(values))
+
+    def replace_box_config_cache(self, values: dict[str, Any]) -> None:
+        self.cache = deepcopy(values)
+
+    def config_port(self, box: str, *, port: int, lo_freq_hz: Any, cnco_freq_hz: Any):
+        self.hardware[box]["ports"][port].update(
+            lo_freq=lo_freq_hz, cnco_freq=cnco_freq_hz
+        )
+
+    def config_channel(self, box: str, *, port: int, channel: int, fnco_freq_hz: int):
+        self.hardware[box]["ports"][port]["channels"][channel]["fnco_freq"] = (
+            fnco_freq_hz
+        )
+
+    def config_runit(self, box: str, *, port: int, runit: int, fnco_freq_hz: int):
+        self.hardware[box]["ports"][port]["runits"][runit]["fnco_freq"] = fnco_freq_hz
+
+    def initialize_awg_and_capunits(self, boxes: Any) -> None:
+        pass
+
+
+class _Quel1SystemManager(_SystemManager):
+    """Plan and apply readout settings through the real QuEL-1 synchronizer path."""
+
+    def __init__(self, backend: _Quel1ReadoutBackend) -> None:
+        super().__init__(None, set())
+        manager = Quel1FrequencyConfigurationManager(cast(Any, backend))
+        ports: dict[int, SimpleNamespace] = {}
+        for number, values in backend.cache["box"]["ports"].items():
+            channels = values.get("channels", values.get("runits"))
+            port = SimpleNamespace(
+                number=number,
+                box_id="box",
+                lo_freq=values["lo_freq"],
+                cnco_freq=values["cnco_freq"],
+            )
+            port.channels = [
+                SimpleNamespace(number=c, fnco_freq=v["fnco_freq"], port=port)
+                for c, v in channels.items()
+            ]
+            ports[number] = port
+        system = SimpleNamespace(
+            control_system=SimpleNamespace(
+                get_port=lambda _box, number: ports[number],
+                get_box=lambda _box: SimpleNamespace(
+                    traits=SimpleNamespace(readout_cnco_center=1_500_000_000)
+                ),
+            ),
+            get_target=lambda _label: SimpleNamespace(
+                channel=ports[1].channels[0], is_read=True, sideband="U"
+            ),
+            get_cap_target=lambda label: SimpleNamespace(
+                channel=ports[2].channels[int(label[1:].lstrip("Q")) % 4]
+            ),
+        )
+        controller = SimpleNamespace(
+            plan_frequency_sweep=manager.plan,
+            modified_sweep_configuration=manager.modified,
+        )
+        synchronizer = Quel1SystemSynchronizer(backend_controller=cast(Any, controller))
+        self.system = SimpleNamespace(
+            experiment_system=system,
+            _resolve_system_synchronizer=lambda: synchronizer,
+        )
+
+    def plan_frequency_sweep(
+        self,
+        target: str,
+        frequencies: Any,
+        *,
+        subrange_width: float | None = None,
+    ) -> tuple[Any, ...]:
+        if not target.startswith("R"):
+            return super().plan_frequency_sweep(
+                target, frequencies, subrange_width=subrange_width
+            )
+        self.plan_calls.append({"target": target, "frequencies": frequencies})
+        return SystemManager.plan_frequency_sweep(
+            cast(Any, self.system), target, frequencies
+        )
+
+    @contextmanager
+    def modified_sweep_configuration(self, configuration: Any):
+        if not isinstance(configuration, Quel1SweepConfiguration):
+            with super().modified_sweep_configuration(configuration):
+                yield
+            return
+        with SystemManager.modified_sweep_configuration(
+            cast(Any, self.system), configuration
+        ):
+            yield
+
+
+def _quel1_experiment() -> tuple[_Experiment, _Quel1ReadoutBackend]:
+    backend = _Quel1ReadoutBackend()
+    exp = _Experiment()
+    exp.ctx.system_manager = _Quel1SystemManager(backend)
+    return exp, backend
+
+
+# Candidates as QDash assigns them: sorted by frequency onto RQ00..RQ03. The two
+# extremes span 440 MHz, beyond one QuEL-1 safe AWG window of +/-200 MHz.
+QUEL1_CANDIDATES = {"RQ02": 10.40, "RQ00": 10.00, "RQ03": 10.44, "RQ01": 10.05}
+
+
+def test_quel1_planner_reads_frequency_pairs_under_shared_oscillators() -> None:
+    """Each QuEL-1 pair shares LO/CNCO and tunes only its own runits within the window."""
+    exp, backend = _quel1_experiment()
+    original = deepcopy(backend.hardware)
+    applied: dict[tuple[str, ...], dict[int, Any]] = {}
+
+    def snapshot(kwargs: dict[str, Any]) -> None:
+        labels = tuple(_readout_labels(kwargs["schedule"]))
+        applied.setdefault(labels, deepcopy(backend.hardware["box"]["ports"]))
+
+    exp.measurement_service.on_execute = snapshot
+
+    result = _run(exp, readout_frequencies=dict(QUEL1_CANDIDATES))
+
+    assert result.data["readout_groups"] == [["RQ00", "RQ01"], ["RQ02", "RQ03"]]
+    assert set(applied) == {("RQ00", "RQ01"), ("RQ02", "RQ03")}
+    for labels, ports in applied.items():
+        generator, capture = ports[1], ports[2]
+        assert (capture["lo_freq"], capture["cnco_freq"]) == (
+            generator["lo_freq"],
+            generator["cnco_freq"],
+        )
+        assert generator["channels"][0]["fnco_freq"] == 0
+        carrier = (generator["lo_freq"] + generator["cnco_freq"]) / 1e9
+        for label in labels:
+            assert abs(QUEL1_CANDIDATES[label] - carrier) <= 0.2
+        runits = {int(label[-1]) for label in labels}
+        assert {
+            r: v["fnco_freq"] for r, v in capture["runits"].items() if r in runits
+        } == dict.fromkeys(runits, 0)
+        assert all(
+            v["fnco_freq"] == 23_437_500
+            for r, v in capture["runits"].items()
+            if r not in runits
+        )
+    assert backend.hardware == backend.cache == original
+
+
+def test_quel1_planner_rejects_extreme_pair_before_hardware() -> None:
+    """A QuEL-1 pair spanning both extremes is rejected with its split windows."""
+    exp, backend = _quel1_experiment()
+    original = deepcopy(backend.hardware)
+
+    with pytest.raises(ValueError, match="RQ00") as excinfo:
+        _run(
+            exp,
+            readout_grouping="multiplexed",
+            readout_frequencies={"RQ00": 10.00, "RQ03": 10.44},
+        )
+
+    message = str(excinfo.value)
+    assert "RQ00=10.000000, RQ03=10.440000 GHz span 440.0 MHz" in message
+    assert "2 windows [RQ00]; [RQ03]" in message
+    assert exp.measurement_service.calls == []
+    assert backend.hardware == backend.cache == original
