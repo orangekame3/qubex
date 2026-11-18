@@ -36,13 +36,26 @@ class _MeasurementResult:
 
 
 class _SystemManager:
-    """Plan sweeps in fixed-size, non-contiguous segments and track contexts."""
+    """Plan drive and readout configurations and record context entry and exit."""
 
-    def __init__(self, segment_indices: list[tuple[int, ...]] | None) -> None:
+    def __init__(
+        self,
+        segment_indices: list[tuple[int, ...]] | None,
+        unrealizable_readouts: set[str],
+    ) -> None:
         self.segment_indices = segment_indices
+        self.unrealizable_readouts = unrealizable_readouts
         self.plan_calls: list[dict[str, Any]] = []
-        self.entered: list[str] = []
-        self.active = 0
+        self.events: list[tuple[str, str]] = []
+        self.stack: list[str] = []
+
+    @property
+    def entered(self) -> list[str]:
+        return [name for event, name in self.events if event == "enter"]
+
+    @property
+    def active(self) -> int:
+        return len(self.stack)
 
     def plan_frequency_sweep(
         self,
@@ -55,40 +68,55 @@ class _SystemManager:
         self.plan_calls.append(
             {"target": target, "frequencies": values, "subrange_width": subrange_width}
         )
-        groups = self.segment_indices or [tuple(range(len(values)))]
+        if target.startswith("R"):
+            groups = (
+                [(i,) for i in range(len(values))]
+                if target in self.unrealizable_readouts
+                else [tuple(range(len(values)))]
+            )
+            prefix = f"readout-{target}"
+        else:
+            groups = self.segment_indices or [tuple(range(len(values)))]
+            prefix = "segment"
         return tuple(
             SimpleNamespace(
                 indices=indices,
                 values=tuple(float(values[i]) for i in indices),
-                configuration=f"segment-{n}",
+                configuration=prefix if prefix != "segment" else f"segment-{n}",
             )
             for n, indices in enumerate(groups)
         )
 
     @contextmanager
     def modified_sweep_configuration(self, configuration: str):
-        self.entered.append(configuration)
-        self.active += 1
+        self.events.append(("enter", configuration))
+        self.stack.append(configuration)
         try:
             yield
         finally:
-            self.active -= 1
+            assert self.stack.pop() == configuration
+            self.events.append(("exit", configuration))
 
 
 class _Context:
-    def __init__(self, segment_indices: list[tuple[int, ...]] | None) -> None:
+    def __init__(
+        self,
+        segment_indices: list[tuple[int, ...]] | None,
+        unrealizable_readouts: set[str],
+    ) -> None:
         self.qubit_labels = list(QUBITS)
         self.params = SimpleNamespace(
             readout_amplitude={q: 0.01 * (i + 1) for i, q in enumerate(QUBITS)},
         )
         self.reset_calls: list[set[str]] = []
-        self.system_manager = _SystemManager(segment_indices)
+        self.system_manager = _SystemManager(segment_indices, unrealizable_readouts)
         self.experiment_system = SimpleNamespace(
             get_control_box_for_qubit=lambda _qubit: SimpleNamespace(
                 traits=SimpleNamespace(
                     default_control_frequency_range=(5.00, 5.025, 0.01),
                 )
-            )
+            ),
+            get_mux_by_qubit=lambda qubit: SimpleNamespace(index=int(qubit[1:]) // 4),
         )
 
     def resolve_qubit_label(self, label: str) -> str:
@@ -112,10 +140,11 @@ class _MeasurementService:
         self.ctx = ctx
         self.fail_on_call = fail_on_call
         self.calls: list[dict[str, Any]] = []
+        self.stacks: list[list[str]] = []
 
     def execute(self, **kwargs: Any) -> _MeasurementResult:
         self.calls.append(kwargs)
-        assert self.ctx.system_manager.active == 1
+        self.stacks.append(list(self.ctx.system_manager.stack))
         if self.fail_on_call is not None and len(self.calls) == self.fail_on_call:
             raise RuntimeError("hardware failure")
         schedule = kwargs["schedule"]
@@ -135,14 +164,31 @@ class _MeasurementService:
         return _MeasurementResult(data)
 
 
+class _Util:
+    """Mirror `ExperimentUtil.create_qubit_subgroups` diagonal grouping by index."""
+
+    def __init__(self) -> None:
+        self.subgroup_calls: list[list[str]] = []
+
+    def create_qubit_subgroups(self, qubits: Any) -> list[list[str]]:
+        labels = list(qubits)
+        self.subgroup_calls.append(labels)
+        return [
+            [q for q in labels if int(q[1:]) % 4 in [0, 3]],
+            [q for q in labels if int(q[1:]) % 4 in [1, 2]],
+        ]
+
+
 class _Experiment:
     def __init__(
         self,
         *,
         fail_on_call: int | None = None,
         segment_indices: list[tuple[int, ...]] | None = None,
+        unrealizable_readouts: set[str] | None = None,
     ) -> None:
-        self.ctx = _Context(segment_indices)
+        self.ctx = _Context(segment_indices, unrealizable_readouts or set())
+        self.util = _Util()
         self.measurement_service = _MeasurementService(self.ctx, fail_on_call)
 
 
@@ -182,7 +228,7 @@ def test_drives_only_the_requested_target_with_all_readouts() -> None:
     """Every schedule drives exactly one control target and reads every candidate slot."""
     exp = _Experiment()
 
-    _run(exp)
+    _run(exp, readout_grouping="multiplexed")
 
     calls = exp.measurement_service.calls
     assert len(calls) == 6
@@ -209,7 +255,7 @@ def test_applies_candidate_frequencies_per_point() -> None:
     """Each point overrides the drive frequency and every candidate readout frequency."""
     exp = _Experiment()
 
-    _run(exp)
+    _run(exp, readout_grouping="multiplexed")
 
     frequencies = [call["frequencies"] for call in exp.measurement_service.calls]
     assert frequencies[0] == {"Q04": 5.00, **READOUT_FREQUENCIES}
@@ -268,19 +314,23 @@ def test_retunes_only_the_drive_target_once_per_segment() -> None:
     """Sweep planning targets the drive line and each segment is applied once."""
     exp = _Experiment(segment_indices=[(0, 1), (2,)])
 
-    _run(exp, subrange_width=0.2)
+    _run(exp, readout_grouping="multiplexed", subrange_width=0.2)
 
     manager = exp.ctx.system_manager
-    assert [c["target"] for c in manager.plan_calls] == ["Q04"]
-    assert manager.plan_calls[0]["subrange_width"] == pytest.approx(0.2)
-    assert manager.entered == ["segment-0", "segment-1"]
+    drive_plans = [c for c in manager.plan_calls if c["target"] == "Q04"]
+    assert len(drive_plans) == 1
+    assert drive_plans[0]["subrange_width"] == pytest.approx(0.2)
+    assert [c for c in manager.entered if c.startswith("segment")] == [
+        "segment-0",
+        "segment-1",
+    ]
 
 
 def test_resets_drive_and_all_readout_resources_per_segment() -> None:
     """AWG/capture reset covers the drive qubit and every candidate slot."""
     exp = _Experiment(segment_indices=[(0, 1), (2,)])
 
-    _run(exp)
+    _run(exp, readout_grouping="multiplexed")
 
     assert exp.ctx.reset_calls == [{"Q00", "Q01", "Q02", "Q03", "Q04"}] * 2
 
@@ -289,7 +339,11 @@ def test_readout_amplitudes_are_applied_per_candidate() -> None:
     """Explicit and default readout amplitudes drive each candidate slot's pulse."""
     exp = _Experiment()
 
-    _run(exp, readout_amplitudes={"RQ01": 0.3, "Q03": 0.4})
+    _run(
+        exp,
+        readout_grouping="multiplexed",
+        readout_amplitudes={"RQ01": 0.3, "Q03": 0.4},
+    )
 
     schedule = exp.measurement_service.calls[0]["schedule"]
     peaks = {
@@ -345,6 +399,7 @@ def test_supports_qubit_label_keys_and_other_candidate_counts() -> None:
 
     result = _run(
         exp,
+        readout_grouping="multiplexed",
         target="Q00",
         readout_frequencies={"Q02": 7.2, "RQ00": 7.0, "Q04": 7.4},
     )
@@ -408,6 +463,8 @@ def test_does_not_mutate_persistent_parameters() -> None:
         ({"power_range": [[-20.0]]}, ValueError, "power_range"),
         ({"power_range": []}, ValueError, "power_range"),
         ({"shots": 0}, ValueError, "shots"),
+        ({"readout_grouping": "diagonal"}, ValueError, "readout_grouping"),
+        ({"readout_grouping": 1}, ValueError, "readout_grouping"),
     ],
 )
 def test_rejects_invalid_inputs(
@@ -421,6 +478,17 @@ def test_rejects_invalid_inputs(
 
     assert exp.measurement_service.calls == []
     assert exp.ctx.system_manager.entered == []
+
+
+def test_rejects_invalid_grouping_before_planning() -> None:
+    """An unknown readout grouping is rejected before any sweep is planned."""
+    exp = _Experiment()
+
+    with pytest.raises(ValueError, match="'multiplexed' or 'subgroups'"):
+        _run(exp, readout_grouping="pairs")
+
+    assert exp.ctx.system_manager.plan_calls == []
+    assert exp.util.subgroup_calls == []
 
 
 def test_rejects_candidate_without_default_amplitude() -> None:
@@ -439,3 +507,235 @@ def test_is_exported_from_contrib() -> None:
     assert contrib.multiplexed_readout_qubit_spectroscopy is (
         multiplexed_readout_qubit_spectroscopy
     )
+
+
+def test_default_grouping_reads_candidates_in_qubit_subgroups() -> None:
+    """By default candidates are read in the experiment's qubit subgroups."""
+    exp = _Experiment()
+
+    result = _run(exp)
+
+    assert result.data["readout_grouping"] == "subgroups"
+    assert result.data["readout_groups"] == [["RQ00", "RQ03"], ["RQ01", "RQ02"]]
+    assert exp.util.subgroup_calls == [["Q00", "Q01", "Q02", "Q03"]]
+
+
+def test_explicit_multiplexed_grouping_reads_every_candidate_in_one_group() -> None:
+    """Explicit multiplexed grouping reads every candidate in one group."""
+    exp = _Experiment()
+
+    result = _run(exp, readout_grouping="multiplexed")
+
+    assert result.data["readout_grouping"] == "multiplexed"
+    assert result.data["readout_groups"] == [["RQ00", "RQ01", "RQ02", "RQ03"]]
+    assert exp.util.subgroup_calls == []
+    for label in READOUT_FREQUENCIES:
+        assert result.data["candidates"][label]["readout_group_index"] == 0
+
+
+def test_configures_every_readout_before_first_measurement() -> None:
+    """Each candidate's readout is configured from all same-mux group frequencies first."""
+    exp = _Experiment()
+
+    _run(exp, readout_grouping="multiplexed")
+
+    manager = exp.ctx.system_manager
+    readout_plans = [c for c in manager.plan_calls if c["target"].startswith("R")]
+    assert [c["target"] for c in readout_plans] == ["RQ00", "RQ01", "RQ02", "RQ03"]
+    for plan in readout_plans:
+        assert_allclose(plan["frequencies"], list(READOUT_FREQUENCIES.values()))
+        assert plan["subrange_width"] is None
+    readouts = [f"readout-{label}" for label in READOUT_FREQUENCIES]
+    assert manager.entered[:5] == [*readouts, "segment-0"]
+    assert exp.measurement_service.stacks[0] == [*readouts, "segment-0"]
+
+
+def test_readout_plans_use_only_same_mux_candidates() -> None:
+    """Candidates on different muxes are configured from their own mux's frequencies."""
+    exp = _Experiment()
+
+    _run(
+        exp,
+        readout_grouping="multiplexed",
+        readout_frequencies={"RQ00": 7.0, "RQ04": 7.5, "RQ01": 7.1},
+    )
+
+    plans = {
+        c["target"]: list(c["frequencies"])
+        for c in exp.ctx.system_manager.plan_calls
+        if c["target"].startswith("R")
+    }
+    assert plans == {"RQ00": [7.0, 7.1], "RQ04": [7.5], "RQ01": [7.0, 7.1]}
+
+
+@pytest.mark.parametrize(
+    ("grouping", "expected_groups"),
+    [
+        (None, [["RQ00", "RQ03"], ["RQ01", "RQ02"]]),
+        ("multiplexed", [["RQ00", "RQ01", "RQ02", "RQ03"]]),
+        ("subgroups", [["RQ00", "RQ03"], ["RQ01", "RQ02"]]),
+    ],
+)
+def test_grouping_modes_select_measured_readouts(
+    grouping: str | None, expected_groups: list[list[str]]
+) -> None:
+    """Each mode measures its groups in turn with the same drive sweep per group."""
+    exp = _Experiment()
+
+    result = _run(exp, readout_grouping=grouping)
+
+    calls = exp.measurement_service.calls
+    assert len(calls) == 6 * len(expected_groups)
+    measured = [_readout_labels(call["schedule"]) for call in calls]
+    assert measured == [group for group in expected_groups for _ in range(6)]
+    for call, labels in zip(calls, measured, strict=True):
+        assert set(call["frequencies"]) == {"Q04", *labels}
+    drive_points = [call["frequencies"]["Q04"] for call in calls]
+    assert drive_points == [5.00, 5.01, 5.02] * 2 * len(expected_groups)
+    assert result.data["readout_groups"] == expected_groups
+
+
+def test_subgroups_reuse_experiment_qubit_subgroups() -> None:
+    """Subgroup mode applies the experiment's qubit subgroups to candidate qubits."""
+    exp = _Experiment()
+
+    result = _run(exp, readout_grouping="subgroups")
+
+    assert exp.util.subgroup_calls == [["Q00", "Q01", "Q02", "Q03"]]
+    assert result.data["readout_grouping"] == "subgroups"
+    groups = {
+        label: result.data["candidates"][label]["readout_group_index"]
+        for label in READOUT_FREQUENCIES
+    }
+    assert groups == {"RQ00": 0, "RQ01": 1, "RQ02": 1, "RQ03": 0}
+
+
+def test_subgroups_configure_readout_per_group() -> None:
+    """Each subgroup configures only its readouts from its own frequencies."""
+    exp = _Experiment()
+
+    _run(exp, readout_grouping="subgroups")
+
+    manager = exp.ctx.system_manager
+    plans = {
+        c["target"]: list(c["frequencies"])
+        for c in manager.plan_calls
+        if c["target"].startswith("R")
+    }
+    assert plans == {
+        "RQ00": [7.30, 7.20],
+        "RQ03": [7.30, 7.20],
+        "RQ01": [7.10, 7.40],
+        "RQ02": [7.10, 7.40],
+    }
+    stacks = exp.measurement_service.stacks
+    assert stacks[0] == ["readout-RQ00", "readout-RQ03", "segment-0"]
+    assert stacks[-1] == ["readout-RQ01", "readout-RQ02", "segment-0"]
+
+
+def test_subgroups_keep_global_candidate_identity_and_order() -> None:
+    """Candidates keep input order, global index, amplitude, and their own signals."""
+    exp = _Experiment()
+
+    result = _run(
+        exp,
+        readout_grouping="subgroups",
+        readout_amplitudes={"RQ02": 0.25},
+    )
+
+    data = result.data
+    assert data["readout_labels"] == ["RQ00", "RQ01", "RQ02", "RQ03"]
+    assert list(data["candidates"]) == ["RQ00", "RQ01", "RQ02", "RQ03"]
+    assert result.figures is not None
+    assert list(result.figures) == ["RQ00", "RQ01", "RQ02", "RQ03"]
+    for index, (label, frequency) in enumerate(READOUT_FREQUENCIES.items()):
+        entry = data["candidates"][label]
+        assert entry["candidate_index"] == index
+        assert entry["readout_frequency"] == pytest.approx(frequency)
+        assert_allclose(entry["signals"].imag, np.full((2, 3), frequency), atol=1e-12)
+    assert data["candidates"]["RQ02"]["readout_amplitude"] == pytest.approx(0.25)
+    peaks = {
+        label: float(np.max(np.abs(call["schedule"].get_sequence(label).values)))
+        for call in exp.measurement_service.calls[:1]
+        + exp.measurement_service.calls[6:7]
+        for label in _readout_labels(call["schedule"])
+    }
+    assert peaks == pytest.approx(
+        {"RQ00": 0.01, "RQ01": 0.02, "RQ02": 0.25, "RQ03": 0.04}
+    )
+
+
+def test_subgroups_skip_empty_groups() -> None:
+    """Empty subgroups are skipped without planning or measuring."""
+    exp = _Experiment()
+
+    result = _run(
+        exp,
+        readout_grouping="subgroups",
+        readout_frequencies={"RQ01": 7.1, "RQ02": 7.4},
+    )
+
+    assert result.data["readout_groups"] == [["RQ01", "RQ02"]]
+    assert len(exp.measurement_service.calls) == 6
+
+
+def test_rejects_unrealizable_multiplexed_group_before_hardware() -> None:
+    """An unrealizable multiplexed group is rejected first with a subgroup hint."""
+    exp = _Experiment(unrealizable_readouts={"RQ01"})
+
+    with pytest.raises(ValueError, match=r"RQ01.*readout_grouping='subgroups'"):
+        _run(exp, readout_grouping="multiplexed")
+
+    assert exp.ctx.system_manager.entered == []
+    assert exp.measurement_service.calls == []
+
+
+def test_rejects_unrealizable_subgroup_without_subgroup_hint() -> None:
+    """An unrealizable subgroup is rejected first without suggesting subgroups again."""
+    exp = _Experiment(unrealizable_readouts={"RQ01"})
+
+    with pytest.raises(ValueError, match="RQ01") as excinfo:
+        _run(exp)
+
+    message = str(excinfo.value)
+    assert "subgroups" not in message
+    assert "fewer candidates" in message
+    assert exp.ctx.system_manager.entered == []
+    assert exp.measurement_service.calls == []
+
+
+def test_restores_every_configuration_after_success() -> None:
+    """Readout and drive configurations are exited in reverse order after success."""
+    exp = _Experiment(segment_indices=[(0, 1), (2,)])
+
+    _run(exp, readout_grouping="subgroups")
+
+    manager = exp.ctx.system_manager
+    assert manager.active == 0
+    assert manager.events[:8] == [
+        ("enter", "readout-RQ00"),
+        ("enter", "readout-RQ03"),
+        ("enter", "segment-0"),
+        ("exit", "segment-0"),
+        ("enter", "segment-1"),
+        ("exit", "segment-1"),
+        ("exit", "readout-RQ03"),
+        ("exit", "readout-RQ00"),
+    ]
+    assert len(manager.events) == 16
+
+
+def test_restores_every_configuration_after_failure_in_later_group() -> None:
+    """A failure in a later group exits all active configurations in reverse order."""
+    exp = _Experiment(fail_on_call=7)
+
+    with pytest.raises(RuntimeError, match="hardware failure"):
+        _run(exp, readout_grouping="subgroups")
+
+    manager = exp.ctx.system_manager
+    assert manager.active == 0
+    assert manager.events[-3:] == [
+        ("exit", "segment-0"),
+        ("exit", "readout-RQ02"),
+        ("exit", "readout-RQ01"),
+    ]
